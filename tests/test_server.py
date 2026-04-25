@@ -8,27 +8,41 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from mcp.types import TextContent
+
 from ntulearn_mcp import server
+from ntulearn_mcp.client import BbRouterExpiredError, NTULearnClient
 
 
-class MissingCookieTests(unittest.IsolatedAsyncioTestCase):
+class _CookieEnvIsolation:
+    """Mixin that snapshots NTULEARN_COOKIE + server._client and restores them."""
+
+    def setUp(self) -> None:
+        self._old_env = os.environ.get("NTULEARN_COOKIE")
+        self._old_client = server._client
+
+    def tearDown(self) -> None:
+        if self._old_env is None:
+            os.environ.pop("NTULEARN_COOKIE", None)
+        else:
+            os.environ["NTULEARN_COOKIE"] = self._old_env
+        server._client = self._old_client
+
+
+class MissingCookieTests(_CookieEnvIsolation, unittest.IsolatedAsyncioTestCase):
     async def test_missing_cookie_returns_mcp_error(self) -> None:
-        old_cookie = server.COOKIE
-        old_client = server._client
-        try:
-            server.COOKIE = ""
-            server._client = None
+        os.environ.pop("NTULEARN_COOKIE", None)
+        server._client = None
+        with mock.patch.object(server, "read_bbrouter_cookie", return_value=None):
             result = await server.call_tool("list_courses", {})
-        finally:
-            server.COOKIE = old_cookie
-            server._client = old_client
 
         self.assertEqual(len(result), 1)
-        self.assertIn("NTULEARN_COOKIE is not set", result[0].text)
+        self.assertIn("No NTULearn cookie found", result[0].text)
 
 
 class DotenvPrecedenceTests(unittest.TestCase):
@@ -40,7 +54,7 @@ class DotenvPrecedenceTests(unittest.TestCase):
             os.environ["NTULEARN_COOKIE"] = "fresh-from-env"
             env_path.write_text("NTULEARN_COOKIE=stale-from-dotenv\n", encoding="utf-8")
             reloaded = importlib.reload(server)
-            self.assertEqual(reloaded.COOKIE, "fresh-from-env")
+            self.assertEqual(reloaded._resolve_cookie(), "fresh-from-env")
         finally:
             if old_env is None:
                 os.environ.pop("NTULEARN_COOKIE", None)
@@ -53,6 +67,102 @@ class DotenvPrecedenceTests(unittest.TestCase):
                 env_path.write_text(old_env_file, encoding="utf-8")
 
             importlib.reload(server)
+
+
+class CookieResolutionTests(_CookieEnvIsolation, unittest.TestCase):
+    def test_env_var_takes_precedence_over_browser(self) -> None:
+        os.environ["NTULEARN_COOKIE"] = "from-env"
+        with mock.patch.object(server, "read_bbrouter_cookie", return_value="from-browser"):
+            self.assertEqual(server._resolve_cookie(), "from-env")
+
+    def test_falls_back_to_browser_when_env_unset(self) -> None:
+        os.environ.pop("NTULEARN_COOKIE", None)
+        with mock.patch.object(server, "read_bbrouter_cookie", return_value="from-browser"):
+            self.assertEqual(server._resolve_cookie(), "from-browser")
+
+    def test_falls_back_to_browser_when_env_blank(self) -> None:
+        os.environ["NTULEARN_COOKIE"] = "   "
+        with mock.patch.object(server, "read_bbrouter_cookie", return_value="from-browser"):
+            self.assertEqual(server._resolve_cookie(), "from-browser")
+
+    def test_raises_when_both_sources_empty(self) -> None:
+        os.environ.pop("NTULEARN_COOKIE", None)
+        with mock.patch.object(server, "read_bbrouter_cookie", return_value=None):
+            with self.assertRaises(RuntimeError) as ctx:
+                server._resolve_cookie()
+        self.assertIn("No NTULearn cookie found", str(ctx.exception))
+
+
+class CookieRefreshTests(_CookieEnvIsolation, unittest.IsolatedAsyncioTestCase):
+    async def asyncTearDown(self) -> None:
+        # _refresh_client may have built a real httpx-backed client; close it
+        # so the test's event loop doesn't complain about leftover sockets.
+        if server._client is not None and server._client is not self._old_client:
+            await server._client.close()
+
+    async def test_call_tool_refreshes_then_retries_after_401(self) -> None:
+        os.environ["NTULEARN_COOKIE"] = "test-cookie"
+        server._client = NTULearnClient(server.BASE_URL, "test-cookie")
+
+        call_count = 0
+        original = server._list_courses
+
+        async def flaky(client: Any, args: dict[str, Any]) -> list[TextContent]:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise BbRouterExpiredError()
+            return [TextContent(type="text", text="success")]
+
+        try:
+            server._list_courses = flaky  # type: ignore[assignment]
+            result = await server.call_tool("list_courses", {})
+        finally:
+            server._list_courses = original  # type: ignore[assignment]
+
+        self.assertEqual(call_count, 2)
+        self.assertEqual(result[0].text, "success")
+
+    async def test_call_tool_surfaces_error_when_refresh_finds_no_cookie(self) -> None:
+        os.environ["NTULEARN_COOKIE"] = "test-cookie"
+        server._client = NTULearnClient(server.BASE_URL, "test-cookie")
+
+        original = server._list_courses
+
+        async def always_expired(client: Any, args: dict[str, Any]) -> list[TextContent]:
+            raise BbRouterExpiredError()
+
+        try:
+            server._list_courses = always_expired  # type: ignore[assignment]
+            # Refresh will look for a cookie and find none.
+            os.environ.pop("NTULEARN_COOKIE", None)
+            with mock.patch.object(server, "read_bbrouter_cookie", return_value=None):
+                result = await server.call_tool("list_courses", {})
+        finally:
+            server._list_courses = original  # type: ignore[assignment]
+
+        self.assertIn("No NTULearn cookie found", result[0].text)
+
+    async def test_call_tool_retries_only_once(self) -> None:
+        os.environ["NTULEARN_COOKIE"] = "test-cookie"
+        server._client = NTULearnClient(server.BASE_URL, "test-cookie")
+
+        call_count = 0
+        original = server._list_courses
+
+        async def always_expired(client: Any, args: dict[str, Any]) -> list[TextContent]:
+            nonlocal call_count
+            call_count += 1
+            raise BbRouterExpiredError()
+
+        try:
+            server._list_courses = always_expired  # type: ignore[assignment]
+            result = await server.call_tool("list_courses", {})
+        finally:
+            server._list_courses = original  # type: ignore[assignment]
+
+        self.assertEqual(call_count, 2)  # initial + one retry, no third attempt
+        self.assertIn("expired", result[0].text.lower())
 
 
 class FakeGradebookClient:

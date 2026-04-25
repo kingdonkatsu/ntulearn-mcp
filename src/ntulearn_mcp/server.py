@@ -13,6 +13,7 @@ from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
 from .client import NTULearnClient, BbRouterExpiredError, BlackboardAPIError
+from .cookie import read_bbrouter_cookie
 from .parsers import extract_all_files
 
 load_dotenv()
@@ -22,8 +23,16 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 
 BASE_URL = os.getenv("NTULEARN_BASE_URL", "https://ntulearn.ntu.edu.sg")
-COOKIE = os.getenv("NTULEARN_COOKIE", "")
 DOWNLOAD_DIR = Path(os.getenv("NTULEARN_DOWNLOAD_DIR", "./downloads"))
+
+_NO_COOKIE_MESSAGE = (
+    "No NTULearn cookie found. Two options:\n"
+    "  1. Log into https://ntulearn.ntu.edu.sg in a supported browser "
+    "(Firefox works best on Windows; Chrome/Edge auto-read often needs "
+    "admin), then restart your MCP host (e.g. Claude Desktop).\n"
+    "  2. Set the NTULEARN_COOKIE env var manually — see README for "
+    "the DevTools cookie-copy steps. This always works."
+)
 
 # ---------------------------------------------------------------------------
 # Server + client setup
@@ -33,14 +42,35 @@ app = Server("ntulearn-mcp")
 _client: NTULearnClient | None = None
 
 
+def _resolve_cookie() -> str:
+    """Resolve the BbRouter cookie. Explicit env var wins over browser auto-read."""
+    explicit = os.getenv("NTULEARN_COOKIE", "").strip()
+    if explicit:
+        return explicit
+    auto = read_bbrouter_cookie()
+    if auto:
+        return auto
+    raise RuntimeError(_NO_COOKIE_MESSAGE)
+
+
 def get_client() -> NTULearnClient:
     global _client
     if _client is None:
-        if not COOKIE:
-            raise RuntimeError(
-                "NTULEARN_COOKIE is not set. Add it to your .env file and restart."
-            )
-        _client = NTULearnClient(BASE_URL, COOKIE)
+        _client = NTULearnClient(BASE_URL, _resolve_cookie())
+    return _client
+
+
+async def _refresh_client() -> NTULearnClient:
+    """Discard the current client, re-read the cookie, build a fresh client.
+
+    Called after a 401 so that an expired cookie can be transparently swapped
+    for the fresh value the user's browser already has.
+    """
+    global _client
+    if _client is not None:
+        await _client.close()
+        _client = None
+    _client = NTULearnClient(BASE_URL, _resolve_cookie())
     return _client
 
 
@@ -218,34 +248,43 @@ async def list_tools() -> list[Tool]:
 
 @app.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
-    import json
-
     try:
-        client = get_client()
-        if name == "list_courses":
-            return await _list_courses(client, arguments)
-        elif name == "get_course_contents":
-            return await _get_course_contents(client, arguments)
-        elif name == "get_folder_children":
-            return await _get_folder_children(client, arguments)
-        elif name == "search_course_content":
-            return await _search_course_content(client, arguments)
-        elif name == "get_file_download_url":
-            return await _get_file_download_url(client, arguments)
-        elif name == "download_file":
-            return await _download_file(client, arguments)
-        elif name == "get_announcements":
-            return await _get_announcements(client, arguments)
-        elif name == "get_gradebook":
-            return await _get_gradebook(client, arguments)
-        else:
-            return _err(ValueError(f"Unknown tool: {name}"))
-    except BbRouterExpiredError as e:
-        return _err(e)
-    except BlackboardAPIError as e:
-        return _err(e)
+        return await _dispatch(name, arguments)
+    except BbRouterExpiredError:
+        # Cookie expired mid-session: try once to swap in a fresh one from the
+        # user's browser, then retry. If either refresh or retry fails, surface.
+        try:
+            await _refresh_client()
+        except Exception as e:
+            return _err(e)
+        try:
+            return await _dispatch(name, arguments)
+        except Exception as e:
+            return _err(e)
     except Exception as e:
         return _err(e)
+
+
+async def _dispatch(name: str, arguments: dict[str, Any]) -> list[TextContent]:
+    client = get_client()
+    if name == "list_courses":
+        return await _list_courses(client, arguments)
+    elif name == "get_course_contents":
+        return await _get_course_contents(client, arguments)
+    elif name == "get_folder_children":
+        return await _get_folder_children(client, arguments)
+    elif name == "search_course_content":
+        return await _search_course_content(client, arguments)
+    elif name == "get_file_download_url":
+        return await _get_file_download_url(client, arguments)
+    elif name == "download_file":
+        return await _download_file(client, arguments)
+    elif name == "get_announcements":
+        return await _get_announcements(client, arguments)
+    elif name == "get_gradebook":
+        return await _get_gradebook(client, arguments)
+    else:
+        return _err(ValueError(f"Unknown tool: {name}"))
 
 
 # ---------------------------------------------------------------------------
